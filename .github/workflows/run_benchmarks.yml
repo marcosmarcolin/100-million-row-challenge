@@ -49,7 +49,9 @@ jobs:
         run: |
           ssh "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
             cd ~/benchmark &&
+            git checkout main &&
             git fetch origin &&
+            git branch -D '$BRANCH' 2> /dev/null &&
             git checkout '$BRANCH' &&
             git pull origin '$BRANCH'
           "
