@@ -51,6 +51,7 @@ jobs:
             cd ~/benchmark &&
             git checkout main &&
             git fetch origin &&
+            git pull origin main &&
             git branch -D '$BRANCH' 2> /dev/null &&
             git checkout '$BRANCH' &&
             git pull origin '$BRANCH'
