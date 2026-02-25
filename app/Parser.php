@@ -8,7 +8,7 @@ final class Parser
 {
     private const int BUCKETS = 256;
     private const int WRITE_BUFFER_SIZE = 1024 * 1024;
-    private const string TMP_PREFIX = 'challenge_';
+    private const string TMP_PREFIX = 'chl_';
     private const int HOST_PREFIX_LEN = 19; // strlen('https://stitcher.io')
 
     public function parse(string $inputPath, string $outputPath): void
