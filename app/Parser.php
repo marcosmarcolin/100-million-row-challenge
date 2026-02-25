@@ -14,9 +14,7 @@ final class Parser
     public function parse(string $inputPath, string $outputPath): void
     {
         $tmpDir = sys_get_temp_dir() . '/' . self::TMP_PREFIX . getmypid();
-        if (!is_dir($tmpDir)) {
-            mkdir($tmpDir, 0777, true);
-        }
+        mkdir($tmpDir, 0777, true);
 
         $bucketPaths = [];
         $bucketHandles = [];
@@ -57,12 +55,8 @@ final class Parser
         }
 
         $allCounts = [];
-
         for ($i = 0; $i < self::BUCKETS; $i++) {
             $bucketFile = $bucketPaths[$i];
-            if (!is_file($bucketFile)) {
-                continue;
-            }
 
             $bh = fopen($bucketFile, 'rb');
 
@@ -80,16 +74,13 @@ final class Parser
             unlink($bucketFile);
         }
 
-        @rmdir($tmpDir);
-
         foreach ($allCounts as &$byDate) {
             ksort($byDate);
         }
-        unset($byDate);
 
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, self::WRITE_BUFFER_SIZE);
-        fwrite($out, "{");
+        fwrite($out, '{');
 
         $firstPath = true;
 
