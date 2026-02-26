@@ -2,13 +2,10 @@
 
 namespace App;
 
-use App\Commands\Visit;
-
 final class Parser
 {
     private const int WORKERS = 8;
     private const int CHUNK_SIZE = 8 * 1024 * 1024;
-    private const string PREFIX = 'https://stitcher.io/blog/';
     private const int PREFIX_LEN = 25;
 
     public function parse(string $inputPath, string $outputPath): void
@@ -41,14 +38,6 @@ final class Parser
             }
         }
 
-        foreach (Visit::all() as $visit) {
-            $slug = \str_replace(self::PREFIX, '', $visit->uri);
-            if (!isset($pathIds[$slug])) {
-                $pathIds[$slug] = $pathCount++;
-                $paths[] = $slug;
-            }
-        }
-
         $dateIds = [];
         $dateStrings = [];
         $dIdx = 0;
@@ -75,12 +64,12 @@ final class Parser
         $boundaries[] = $fileSize;
         \fclose($handle);
 
-        $tmpDir = \sys_get_temp_dir();
+        $tmpDir = '/tmp';
         $pids = [];
         $files = [];
 
         for ($w = 0; $w < self::WORKERS; $w++) {
-            $tmpFile = "$tmpDir/challenge_{$w}.bin";
+            $tmpFile = $tmpDir . '/' . 'chl_' . $w . '.bin';
             $pid = \pcntl_fork();
 
             if ($pid === 0) {
