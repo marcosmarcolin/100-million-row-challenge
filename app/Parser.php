@@ -8,7 +8,7 @@ use App\Commands\Visit;
 
 final class Parser
 {
-    private const int WORKERS = 6;
+    private const int WORKERS = 8;
     private const int CHUNK_SIZE = 8 * 1024 * 1024; // 8MB
     private const string PREFIX = 'https://stitcher.io/blog/';
 
