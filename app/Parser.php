@@ -4,225 +4,169 @@ declare(strict_types=1);
 
 namespace App;
 
+use App\Commands\Visit;
+
 final class Parser
 {
-    private const int BUCKETS = 256;
-
-    private const int READ_CHUNK_SIZE = 8 * 1024 * 1024;
-    private const int WRITE_BUFFER_SIZE = 1024 * 1024;
-
-    private const string TMP_PREFIX = 'challenge_';
-
-    private const int HOST_PREFIX_LEN = 19; // strlen('https://stitcher.io')
-    private const int DATE_LEN = 10;
+    private const int WORKERS = 4;
+    private const int CHUNK_SIZE = 8 * 1024 * 1024; // 8MB
+    private const string PREFIX = 'https://stitcher.io/blog/';
 
     public function parse(string $inputPath, string $outputPath): void
     {
-        $tmpDir = sys_get_temp_dir() . '/' . self::TMP_PREFIX . getmypid();
-        if (!is_dir($tmpDir)) {
-            mkdir($tmpDir, 0777, true);
-        }
+        gc_disable();
 
-        $bucketPaths = [];
-        $bucketHandles = [];
+        $fileSize = filesize($inputPath);
+        $handle = fopen($inputPath, 'rb');
 
-        for ($i = 0; $i < self::BUCKETS; $i++) {
-            $bucketPaths[$i] = $tmpDir . '/b_' . $i . '.tmp';
-            $h = fopen($bucketPaths[$i], 'wb');
-            stream_set_write_buffer($h, self::WRITE_BUFFER_SIZE);
-            $bucketHandles[$i] = $h;
-        }
+        $sample = fread($handle, 2 * 1024 * 1024);
+        $pathIds = [];
+        $paths = [];
+        $pathCount = 0;
 
-        $seenPaths = [];
-        $pathOrder = [];
-
-        $in = fopen($inputPath, 'rb');
-        $carry = '';
-
-        while (!feof($in)) {
-            $chunk = fread($in, self::READ_CHUNK_SIZE);
-            if ($chunk === '' || $chunk === false) {
-                break;
-            }
-
-            $buf = $carry . $chunk;
-            $lastNl = strrpos($buf, "\n");
-            if ($lastNl === false) {
-                $carry = $buf;
-                continue;
-            }
-
-            $carry = substr($buf, $lastNl + 1);
-            $buf = substr($buf, 0, $lastNl + 1);
-
-            $pos = 0;
-
-            while (true) {
-                $nlPos = strpos($buf, "\n", $pos);
-                if ($nlPos === false) {
-                    break;
-                }
-
-                $lineEnd = $nlPos;
-                if ($lineEnd > $pos && $buf[$lineEnd - 1] === "\r") {
-                    $lineEnd--;
-                }
-
-                $commaPos = strpos($buf, ',', $pos);
-                if ($commaPos === false || $commaPos >= $lineEnd) {
-                    $pos = $nlPos + 1;
-                    continue;
-                }
-
-                $date = substr($buf, $commaPos + 1, self::DATE_LEN);
-
-                $pathStart = $pos + self::HOST_PREFIX_LEN;
-                $path = substr($buf, $pathStart, $commaPos - $pathStart);
-
-                if (!isset($seenPaths[$path])) {
-                    $seenPaths[$path] = true;
-                    $pathOrder[] = $path;
-                }
-
-                $bucket = crc32($path) & (self::BUCKETS - 1);
-                fwrite($bucketHandles[$bucket], $path . "\t" . $date . "\n");
-
-                $pos = $nlPos + 1;
+        preg_match_all('/https:\/\/stitcher\.io\/blog\/([^,]+)/', $sample, $matches);
+        foreach ($matches[1] as $slug) {
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug] = $pathCount++;
+                $paths[] = $slug;
             }
         }
 
-        if ($carry !== '') {
-            $line = rtrim($carry, "\r\n");
-            if ($line !== '') {
-                $commaPos = strpos($line, ',');
-                $date = substr($line, $commaPos + 1, self::DATE_LEN);
-                $path = substr($line, self::HOST_PREFIX_LEN, $commaPos - self::HOST_PREFIX_LEN);
-
-                if (!isset($seenPaths[$path])) {
-                    $seenPaths[$path] = true;
-                    $pathOrder[] = $path;
-                }
-
-                $bucket = crc32($path) & (self::BUCKETS - 1);
-                fwrite($bucketHandles[$bucket], $path . "\t" . $date . "\n");
+        foreach (Visit::all() as $visit) {
+            $slug = str_replace(self::PREFIX, '', $visit->uri);
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug] = $pathCount++;
+                $paths[] = $slug;
             }
         }
 
-        fclose($in);
+        $dateIds = [];
+        $dateStrings = [];
+        $dIdx = 0;
+        for ($y = 2020; $y <= 2026; $y++) {
+            for ($m = 1; $m <= 12; $m++) {
+                $mS = sprintf('%02d', $m);
+                for ($d = 1; $d <= 31; $d++) {
+                    $dS = sprintf('%02d', $d);
+                    $dateStr = "$y-$mS-$dS";
+                    $dateIds[$dateStr] = $dIdx;
+                    $dateStrings[$dIdx] = $dateStr;
+                    $dIdx++;
+                }
+            }
+        }
+        $totalDates = $dIdx;
 
-        foreach ($bucketHandles as $h) {
-            fclose($h);
+        $boundaries = [0];
+        for ($i = 1; $i < self::WORKERS; $i++) {
+            fseek($handle, (int)($fileSize * $i / self::WORKERS));
+            fgets($handle);
+            $boundaries[] = ftell($handle);
+        }
+        $boundaries[] = $fileSize;
+        fclose($handle);
+
+        $tmpDir = sys_get_temp_dir();
+        $pids = [];
+        $files = [];
+
+        for ($w = 0; $w < self::WORKERS; $w++) {
+            $tmpFile = "$tmpDir/challenge_{$w}.bin";
+            $pid = pcntl_fork();
+
+            if ($pid === 0) {
+                $this->workerProcess($inputPath, $boundaries[$w], $boundaries[$w + 1], $pathIds, $dateIds, $pathCount, $totalDates, $tmpFile);
+                exit(0);
+            }
+            $pids[] = $pid;
+            $files[] = $tmpFile;
         }
 
-        $allCounts = [];
-
-        for ($i = 0; $i < self::BUCKETS; $i++) {
-            $bucketFile = $bucketPaths[$i];
-            if (!is_file($bucketFile)) {
-                continue;
+        $totalCounts = array_fill(0, $pathCount * $totalDates, 0);
+        foreach ($pids as $idx => $pid) {
+            pcntl_waitpid($pid, $status);
+            $wData = unpack('V*', file_get_contents($files[$idx]));
+            unlink($files[$idx]);
+            foreach ($wData as $k => $v) {
+                if ($v > 0) $totalCounts[$k - 1] += $v;
             }
-
-            $bh = fopen($bucketFile, 'rb');
-            $carry = '';
-
-            while (!feof($bh)) {
-                $chunk = fread($bh, self::READ_CHUNK_SIZE);
-                if ($chunk === '' || $chunk === false) {
-                    break;
-                }
-
-                $buf = $carry . $chunk;
-                $lastNl = strrpos($buf, "\n");
-                if ($lastNl === false) {
-                    $carry = $buf;
-                    continue;
-                }
-
-                $carry = substr($buf, $lastNl + 1);
-                $buf = substr($buf, 0, $lastNl + 1);
-
-                $pos = 0;
-
-                while (true) {
-                    $nlPos = strpos($buf, "\n", $pos);
-                    if ($nlPos === false) {
-                        break;
-                    }
-
-                    $lineEnd = $nlPos;
-                    if ($lineEnd > $pos && $buf[$lineEnd - 1] === "\r") {
-                        $lineEnd--;
-                    }
-
-                    $tabPos = strpos($buf, "\t", $pos);
-                    if ($tabPos === false || $tabPos >= $lineEnd) {
-                        $pos = $nlPos + 1;
-                        continue;
-                    }
-
-                    $path = substr($buf, $pos, $tabPos - $pos);
-                    $date = substr($buf, $tabPos + 1, self::DATE_LEN);
-
-                    $allCounts[$path][$date] = ($allCounts[$path][$date] ?? 0) + 1;
-
-                    $pos = $nlPos + 1;
-                }
-            }
-
-            if ($carry !== '') {
-                $line = rtrim($carry, "\r\n");
-                if ($line !== '') {
-                    $tabPos = strpos($line, "\t");
-                    $path = substr($line, 0, $tabPos);
-                    $date = substr($line, $tabPos + 1, self::DATE_LEN);
-                    $allCounts[$path][$date] = ($allCounts[$path][$date] ?? 0) + 1;
-                }
-            }
-
-            fclose($bh);
-            unlink($bucketFile);
         }
 
-        @rmdir($tmpDir);
+        $this->writeFinalJson($outputPath, $paths, $dateStrings, $totalCounts, $pathCount, $totalDates);
+    }
 
-        foreach ($allCounts as &$byDate) {
-            ksort($byDate);
-        }
-        unset($byDate);
+    private function workerProcess($path, $start, $end, $pathIds, $dateIds, $pathCount, $totalDates, $tmpFile): void
+    {
+        $counts = array_fill(0, $pathCount * $totalDates, 0);
+        $h = fopen($path, 'rb');
+        fseek($h, $start);
+        $remaining = $end - $start;
+        $prefixLen = strlen(self::PREFIX);
 
-        $out = fopen($outputPath, 'wb');
-        stream_set_write_buffer($out, self::WRITE_BUFFER_SIZE);
-        fwrite($out, "{");
+        while ($remaining > 0) {
+            $chunk = fread($h, min($remaining, self::CHUNK_SIZE));
+            $len = strlen($chunk);
+            if ($len === 0) break;
+            $remaining -= $len;
 
-        $firstPath = true;
+            $lastNl = strrpos($chunk, "\n");
+            if ($lastNl === false) continue;
 
-        foreach ($pathOrder as $path) {
-            if (!isset($allCounts[$path])) {
-                continue;
+            $diff = $len - ($lastNl + 1);
+            if ($diff > 0) {
+                fseek($h, -$diff, SEEK_CUR);
+                $remaining += $diff;
             }
 
-            $escapedPath = str_replace('/', '\\/', $path);
+            $offset = 0;
+            while (($nl = strpos($chunk, "\n", $offset)) !== false && $nl <= $lastNl) {
+                $line = substr($chunk, $offset, $nl - $offset);
+                $offset = $nl + 1;
+                if ($line === '') continue;
 
-            $bufOut = $firstPath ? '' : ',';
-            $firstPath = false;
+                $comma = strpos($line, ',');
+                $slug = substr($line, $prefixLen, $comma - $prefixLen);
+                $date = substr($line, $comma + 1, 10);
 
-            $bufOut .= "\n    \"{$escapedPath}\": {\n";
+                if (isset($pathIds[$slug])) {
+                    $counts[($pathIds[$slug] * $totalDates) + $dateIds[$date]]++;
+                }
+            }
+        }
+        file_put_contents($tmpFile, pack('V*', ...$counts));
+    }
 
+    private function writeFinalJson($outPath, $paths, $dateStrings, $counts, $pathCount, $totalDates): void
+    {
+        $fp = fopen($outPath, 'wb');
+        fwrite($fp, "{\n");
+        $firstSlug = true;
+
+        foreach ($paths as $pIdx => $slug) {
+            $base = $pIdx * $totalDates;
+            $slugData = "";
+            $hasData = false;
             $firstDate = true;
-            foreach ($allCounts[$path] as $date => $count) {
-                if (!$firstDate) {
-                    $bufOut .= ",\n";
+
+            for ($d = 0; $d < $totalDates; $d++) {
+                $val = $counts[$base + $d];
+                if ($val > 0) {
+                    if (!$firstDate) $slugData .= ",\n";
+                    $slugData .= "        \"{$dateStrings[$d]}\": $val";
+                    $hasData = true;
+                    $firstDate = false;
                 }
-                $firstDate = false;
-                $bufOut .= "        \"{$date}\": {$count}";
             }
 
-            $bufOut .= "\n    }";
-
-            fwrite($out, $bufOut);
+            if ($hasData) {
+                if (!$firstSlug) fwrite($fp, ",\n");
+                $escapedSlug = str_replace('/', '\/', $slug);
+                fwrite($fp, "    \"\/blog\/{$escapedSlug}\": {\n{$slugData}\n    }");
+                $firstSlug = false;
+            }
         }
 
-        fwrite($out, "\n}");
-        fclose($out);
+        fwrite($fp, "\n}");
+        fclose($fp);
     }
 }
