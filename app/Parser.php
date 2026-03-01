@@ -4,169 +4,103 @@ namespace App;
 
 final class Parser
 {
-    private const int CHUNK_SIZE = 8 * 1024 * 1024;
+    private const int CHUNK_SIZE = 512 * 1024;
     private const int PREFIX_LEN = 25;
-    private const int YEAR_START = 2020;
-    private const int YEAR_END = 2026;
 
     public function parse(string $inputPath, string $outputPath): void
     {
         \gc_disable();
 
-        $totalDates = (self::YEAR_END - self::YEAR_START + 1) * 12 * 31; // 7 * 372 = 2604
-        $dateStrings = $this->buildDateStrings();
+        $dateMap = [];
+        $dateStrings = [];
+        $dIdx = 0;
+        for ($y = 2020; $y <= 2026; $y++) {
+            for ($m = 1; $m <= 12; $m++) {
+                $mS = sprintf('%02d', $m);
+                for ($d = 1; $d <= 31; $d++) {
+                    $dS = sprintf('%02d', $d);
+                    $key = "$y-$mS-$dS";
+                    $dateMap[$key] = $dIdx;
+                    $dateStrings[$dIdx] = $key;
+                    $dIdx++;
+                }
+            }
+        }
+        $totalDates = $dIdx;
 
         $pathIds = [];
         $paths = [];
         $counts = [];
+        $pathCount = 0;
 
         $h = \fopen($inputPath, 'rb');
+        \stream_set_read_buffer($h, 0);
 
-        $carry = '';
         while (!\feof($h)) {
             $chunk = \fread($h, self::CHUNK_SIZE);
-            if ($chunk === false || $chunk === '') {
-                break;
-            }
-
-            if ($carry !== '') {
-                $chunk = $carry . $chunk;
-            }
+            if ($chunk === '' || $chunk === false) break;
 
             $lastNl = \strrpos($chunk, "\n");
-            if ($lastNl === false) {
-                $carry = $chunk;
-                continue;
+            if ($lastNl === false) continue;
+
+            $extra = \strlen($chunk) - $lastNl - 1;
+            if ($extra > 0) {
+                \fseek($h, -$extra, \SEEK_CUR);
             }
 
-            $carry = \substr($chunk, $lastNl + 1);
-            $data = \substr($chunk, 0, $lastNl + 1);
+            $p = 0;
+            while ($p < $lastNl) {
+                $comma = \strpos($chunk, ',', $p + self::PREFIX_LEN);
+                if ($comma === false || $comma > $lastNl) break;
 
-            $offset = 0;
-            while (($nl = \strpos($data, "\n", $offset)) !== false) {
-                $lineLen = $nl - $offset;
-                if ($lineLen <= 0) {
-                    $offset = $nl + 1;
-                    continue;
-                }
+                $slug = \substr($chunk, $p + self::PREFIX_LEN, $comma - ($p + self::PREFIX_LEN));
+                $dateKey = \substr($chunk, $comma + 1, 10);
 
-                $line = \substr($data, $offset, $lineLen);
-                $offset = $nl + 1;
-
-                $comma = \strpos($line, ',');
-                if ($comma === false || $comma <= self::PREFIX_LEN) {
-                    continue;
-                }
-
-                $slug = \substr($line, self::PREFIX_LEN, $comma - self::PREFIX_LEN);
-
-                $datePos = $comma + 1;
-                if (!isset($line[$datePos + 9])) {
-                    continue;
-                }
-
-                $dateId = $this->dateIdFromLine($line, $datePos);
-                if ($dateId < 0 || $dateId >= $totalDates) {
-                    continue;
-                }
+                $p = \strpos($chunk, "\n", $comma) + 1;
 
                 if (!isset($pathIds[$slug])) {
-                    $pathIds[$slug] = \count($paths);
-                    $paths[] = $slug;
-
+                    $pathIds[$slug] = $pathCount;
+                    $paths[$pathCount] = $slug;
                     for ($i = 0; $i < $totalDates; $i++) {
-                        $counts[] = 0;
+                        $counts[$pathCount * $totalDates + $i] = 0;
                     }
+                    $pathCount++;
                 }
 
-                $pIdx = $pathIds[$slug];
-                $counts[($pIdx * $totalDates) + $dateId]++;
+                if (isset($dateMap[$dateKey])) {
+                    $counts[($pathIds[$slug] * $totalDates) + $dateMap[$dateKey]]++;
+                }
             }
         }
-
         \fclose($h);
 
         $this->writeFinalJson($outputPath, $paths, $dateStrings, $counts, $totalDates);
     }
 
-    private function buildDateStrings(): array
-    {
-        $dateStrings = [];
-        $idx = 0;
-
-        for ($y = self::YEAR_START; $y <= self::YEAR_END; $y++) {
-            for ($m = 1; $m <= 12; $m++) {
-                $mS = $m < 10 ? '0' . $m : (string)$m;
-
-                for ($d = 1; $d <= 31; $d++) {
-                    $dS = $d < 10 ? '0' . $d : (string)$d;
-                    $dateStrings[$idx++] = $y . '-' . $mS . '-' . $dS;
-                }
-            }
-        }
-
-        return $dateStrings;
-    }
-
-    private function dateIdFromLine(string $line, int $pos): int
-    {
-        // YYYY-MM-DD em $line[$pos..$pos+9]
-        // id = (year-2020)*372 + (month-1)*31 + (day-1)
-        $y =
-            ((\ord($line[$pos]) - 48) * 1000) +
-            ((\ord($line[$pos + 1]) - 48) * 100) +
-            ((\ord($line[$pos + 2]) - 48) * 10) +
-            (\ord($line[$pos + 3]) - 48);
-
-        $m =
-            ((\ord($line[$pos + 5]) - 48) * 10) +
-            (\ord($line[$pos + 6]) - 48);
-
-        $d =
-            ((\ord($line[$pos + 8]) - 48) * 10) +
-            (\ord($line[$pos + 9]) - 48);
-
-        return ($y - self::YEAR_START) * 372 + ($m - 1) * 31 + ($d - 1);
-    }
-
-    private function writeFinalJson(string $outPath, array $paths, array $dateStrings, array $counts, int $totalDates): void
+    private function writeFinalJson($outPath, $paths, $dateStrings, $counts, $totalDates): void
     {
         $fp = \fopen($outPath, 'wb');
-
         \fwrite($fp, "{\n");
-        $firstSlug = true;
 
+        $isFirstPath = true;
         foreach ($paths as $pIdx => $slug) {
             $base = $pIdx * $totalDates;
-
-            $slugData = '';
-            $hasData = false;
-            $firstDate = true;
+            $entries = [];
 
             for ($d = 0; $d < $totalDates; $d++) {
-                $val = $counts[$base + $d] ?? 0;
+                $val = $counts[$base + $d];
                 if ($val > 0) {
-                    if (!$firstDate) {
-                        $slugData .= ",\n";
-                    }
-                    $slugData .= "        \"{$dateStrings[$d]}\": {$val}";
-                    $hasData = true;
-                    $firstDate = false;
+                    $entries[] = "        \"{$dateStrings[$d]}\": {$val}";
                 }
             }
 
-            if ($hasData) {
-                if (!$firstSlug) {
-                    \fwrite($fp, ",\n");
-                }
-
-                $escapedSlug = \str_replace('/', '\/', $slug);
-                \fwrite($fp, "    \"\/blog\/{$escapedSlug}\": {\n{$slugData}\n    }");
-
-                $firstSlug = false;
+            if (!empty($entries)) {
+                if (!$isFirstPath) \fwrite($fp, ",\n");
+                $escaped = \str_replace('/', '\/', $slug);
+                \fwrite($fp, "    \"\/blog\/{$escaped}\": {\n" . \implode(",\n", $entries) . "\n    }");
+                $isFirstPath = false;
             }
         }
-
         \fwrite($fp, "\n}");
         \fclose($fp);
     }
